@@ -1,0 +1,53 @@
+name: keep-warm
+
+# Pings the FLUX health endpoint so Render's free tier does not spin the
+# service down. Render idles a free web service after ~15 minutes without an
+# inbound request; the next visitor then waits for a cold start, measured at
+# 13.5 s for /app on 15 Sep 2026. In the iOS wrapper a cold start is a blank
+# screen that never recovers, so this is a release-review risk, not a nicety.
+#
+# WHY THIS LIVES IN A PUBLIC REPO OF ITS OWN
+# GitHub Actions minutes are free and unmetered for public repositories, and
+# billed for private ones. In alexvlismas/flux-server (private) a schedule
+# tight enough to beat a 15-minute idle costs 3,086-8,640 minutes/month against
+# a 2,000-minute allowance. This repo holds nothing but this file and curls an
+# already-public URL, so making it public leaks nothing.
+#
+# WHY */5 AND NOT */14
+# GitHub's scheduled runs are best-effort and routinely fire late — commonly
+# 5-20 minutes, occasionally skipped entirely, and worst on the hour. A cadence
+# that only just beats the idle window would not survive that drift. */5 buys
+# roughly three attempts per window, and the offsets avoid the contended :00.
+on:
+  schedule:
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
+  workflow_dispatch:
+
+# A late run must not queue behind an in-flight one.
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping the health endpoint
+        run: |
+          set -uo pipefail
+          URL="https://fluxclash.com/api/health"
+          # --max-time is generous on purpose: a COLD start is exactly the case
+          # this is meant to absorb, and a spun-down instance answers slowly.
+          # Timing out here would be the one moment the ping was needed most.
+          read -r code total < <(curl -sS -o /dev/null -m 60 \
+            -w '%{http_code} %{time_total}\n' "$URL") || true
+          # NB: the trailing \n matters. Without it curl's output has no newline,
+          # so `read` hits EOF and returns non-zero even though the request
+          # succeeded - which made every run fail, and every run email.
+          [ -n "${code:-}" ] || { echo "curl produced no status"; exit 1; }
+          echo "$URL -> HTTP $code in ${total}s"
+          # Failing loudly makes this an uptime alarm as well as a keep-warm:
+          # GitHub emails on a failed scheduled run, so a real outage surfaces
+          # instead of being absorbed silently.
+          [ "$code" = "200" ] || { echo "expected 200"; exit 1; }
